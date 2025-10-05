@@ -1,13 +1,10 @@
 # fusion_pipeline.py
 """
-Robust FusionPipeline (REPLACEMENT)
-- Uses TextPipeline and ImagePipeline from text_pipeline.py and image_pipeline.py
-- Projects text and image embeddings to a common latent space (small MLPs)
-- Contrastive training available via train_projection()
-- This version is resilient to different DataLoader batch shapes and to encoding errors
-  (bad images/texts won't crash the training loop; they will be skipped with a warning).
-Note: All caches / saved weights are written to the current working directory (no subdirectories),
-so they are accessible to the grader (matches submission rules).
+Robust FusionPipeline replacement.
+- Handles many DataLoader batch shapes robustly.
+- Skips bad samples (with warnings) instead of crashing.
+- Saves projection weights only if training processed >=1 batch.
+All files (weights/caches) are saved in the working directory to meet submission rules.
 """
 
 import os
@@ -35,13 +32,7 @@ class SimpleProjection(nn.Module):
         return self.net(x)
 
 class PairDataset(Dataset):
-    """
-    Simple paired dataset: returns (image_path, text) tuples.
-    DataLoader default collate may return either:
-      - list of tuples: [(img1, txt1), (img2, txt2), ...]
-      - tuple of lists: ( [img1,img2,...], [txt1,txt2,...] )
-    This trainer handles both forms.
-    """
+    """Dataset returns (image_path, text) tuples."""
     def __init__(self, pairs: List[Tuple[str, str]]):
         self.pairs = pairs
 
@@ -50,6 +41,70 @@ class PairDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.pairs[idx]
+
+def unpack_batch(batch):
+    """
+    Robustly unpack a DataLoader batch into (img_paths_list, texts_list).
+    Accepts:
+      - list of tuples: [(img1, txt1), (img2, txt2), ...]
+      - tuple of lists: ([img1,img2,...], [txt1,txt2,...])
+      - nested singletons, etc.
+    Returns: (list_of_img_paths, list_of_texts) or ([],[]) on failure.
+    """
+    # empty batch
+    if batch is None:
+        return [], []
+    # If it's a list
+    if isinstance(batch, list):
+        if len(batch) == 0:
+            return [], []
+        # list of tuples/lists
+        if isinstance(batch[0], (tuple, list)) and len(batch[0]) >= 2:
+            try:
+                img_paths, texts = zip(*batch)
+                return list(img_paths), list(texts)
+            except Exception:
+                # try flattening
+                flat = []
+                for item in batch:
+                    if isinstance(item, (tuple, list)) and len(item) >= 2:
+                        flat.append((item[0], item[1]))
+                if flat:
+                    img_paths, texts = zip(*flat)
+                    return list(img_paths), list(texts)
+                return [], []
+        # else it's a list but maybe nested differently: try zip
+        try:
+            img_paths, texts = zip(*batch)
+            return list(img_paths), list(texts)
+        except Exception:
+            return [], []
+
+    # If it's a tuple (likely tuple-of-lists)
+    if isinstance(batch, tuple):
+        if len(batch) == 2 and isinstance(batch[0], (list, tuple)) and isinstance(batch[1], (list, tuple)):
+            return list(batch[0]), list(batch[1])
+        # otherwise try to zip
+        try:
+            img_paths, texts = zip(*batch)
+            return list(img_paths), list(texts)
+        except Exception:
+            # try to extract (a,b) pairs from elements
+            flat = []
+            for item in batch:
+                if isinstance(item, (tuple, list)) and len(item) >= 2:
+                    flat.append((item[0], item[1]))
+            if flat:
+                img_paths, texts = zip(*flat)
+                return list(img_paths), list(texts)
+            return [], []
+
+    # fallback
+    try:
+        img_paths, texts = zip(*batch)
+        return list(img_paths), list(texts)
+    except Exception:
+        return [], []
 
 class FusionPipeline:
     def __init__(self,
@@ -65,11 +120,11 @@ class FusionPipeline:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[FusionPipeline] device={self.device}")
 
-        # Load lightweight encoders
+        # Load encoders
         self.text_pipe = TextPipeline(model_name=text_model_name, device=self.device)
         self.img_pipe = ImagePipeline(model_name=clip_model_name, device=self.device)
 
-        # Determine text embedding dim
+        # infer text dim
         try:
             sample_text = "sample text to infer dimension"
             t_emb = self.text_pipe.encode(sample_text, use_cache=False)
@@ -79,51 +134,48 @@ class FusionPipeline:
             print("[FusionPipeline] Warning: couldn't infer text dim, defaulting to 384:", e)
             text_dim = 384
 
-        # Determine image embedding dim (attempt to query CLIP by encoding a demo image if present)
+        # infer img dim (try to encode a local png if present)
         img_dim = None
-        demo_candidates = [p for p in os.listdir(".") if p.lower().endswith(".png")]
-        if demo_candidates:
-            demo_img = demo_candidates[0]
-            try:
+        try:
+            demo_candidates = [p for p in os.listdir(".") if p.lower().endswith(".png")]
+            if demo_candidates:
+                demo_img = demo_candidates[0]
                 i_emb = self.img_pipe.encode(demo_img, use_cache=False)
                 img_dim = i_emb.shape[-1]
                 print(f"[FusionPipeline] detected image embedding dim = {img_dim} (from {demo_img})")
-            except Exception as e:
-                print("[FusionPipeline] Warning: failed to encode demo image to infer dim:", e)
-                img_dim = None
+        except Exception as e:
+            print("[FusionPipeline] Warning: couldn't infer img dim:", e)
 
         if img_dim is None:
-            # fall back to commonly used CLIP dim
             img_dim = 512
-            print(f"[FusionPipeline] falling back to default image embedding dim = {img_dim}")
+            print(f"[FusionPipeline] falling back to default img dim = {img_dim}")
 
-        # Projection heads (map text/image embeddings -> shared proj_dim)
+        # projection heads
         self.text_proj = SimpleProjection(in_dim=text_dim, out_dim=proj_dim).to(self.device)
         self.img_proj = SimpleProjection(in_dim=img_dim, out_dim=proj_dim).to(self.device)
 
-        # weights file (in working directory)
         self._weights_file = "proj_weights.pt"
 
     def fuse(self, clinical_note: str, image_path: str, use_cache=True) -> float:
         """
         Compute cosine similarity between projected text and image embeddings.
-        Returns a float scalar in [-1, 1].
+        Returns float in [-1,1]. If encoding fails returns 0.0.
         """
         with torch.no_grad():
             try:
                 t_emb = self.text_pipe.encode(clinical_note, use_cache=use_cache).float().to(self.device)
             except Exception as e:
-                print(f"[Fusion] Error encoding text: {e}; returning score 0.0")
+                print(f"[Fusion] Error encoding text: {e}; returning 0.0")
                 return 0.0
             try:
                 i_emb = self.img_pipe.encode(image_path, use_cache=use_cache).float().to(self.device)
             except Exception as e:
-                print(f"[Fusion] Error encoding image {image_path}: {e}; returning score 0.0")
+                print(f"[Fusion] Error encoding image {image_path}: {e}; returning 0.0")
                 return 0.0
 
-            # Project and normalize
             t_proj = self.text_proj(t_emb.unsqueeze(0)).squeeze(0)
             i_proj = self.img_proj(i_emb.unsqueeze(0)).squeeze(0)
+
             t_norm = F.normalize(t_proj, dim=-1)
             i_norm = F.normalize(i_proj, dim=-1)
             score = float(torch.matmul(t_norm, i_norm).cpu().item())
@@ -134,118 +186,98 @@ class FusionPipeline:
                          lr: float = 1e-3, temperature: float = 0.07,
                          save: bool = True):
         """
-        Train only the projection heads with a contrastive (InfoNCE) style loss.
-        - pairs: list of (image_path, clinical_note)
-        - This function is robust to mixed/failed encodings; bad samples are skipped.
+        Train only projection heads using contrastive loss.
+        - Silently skips bad samples
+        - Saves weights only if >=1 batch processed
         """
         if not pairs:
-            print("[Fusion.train_projection] No pairs provided; aborting training.")
+            print("[Fusion.train_projection] No pairs provided; returning.")
             return
 
         ds = PairDataset(pairs)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
-        optimizer = torch.optim.Adam(list(self.text_proj.parameters()) + list(self.img_proj.parameters()), lr=lr)
+        opt = torch.optim.Adam(list(self.text_proj.parameters()) + list(self.img_proj.parameters()), lr=lr)
 
         self.text_proj.train(); self.img_proj.train()
 
+        total_processed_batches = 0
+
         for epoch in range(epochs):
             total_loss = 0.0
-            batches = 0
+            processed_batches = 0
             for batch_idx, batch in enumerate(loader):
-                # Handle different batch shapes robustly:
-                # - batch could be a list of tuples [(img1,txt1), ...]
-                # - or a tuple of lists ([img1,img2], [txt1,txt2])
-                try:
-                    if isinstance(batch, (list, tuple)) and len(batch) == 2 and isinstance(batch[0], list):
-                        # tuple of lists: ( [img_paths], [texts] )
-                        img_paths, texts = batch[0], batch[1]
-                    else:
-                        # likely list of tuples
-                        img_paths, texts = zip(*batch)
-                except Exception:
-                    # fallback: attempt zip
-                    try:
-                        img_paths, texts = zip(*batch)
-                    except Exception as e:
-                        print(f"[Fusion.train_projection] Could not unpack batch #{batch_idx}: {e}; skipping batch")
-                        continue
+                img_paths, texts = unpack_batch(batch)
+                if not img_paths or not texts:
+                    print(f"[Fusion.train_projection] Could not unpack batch #{batch_idx}; skipping")
+                    continue
 
-                # Encode images (per-sample) and texts in batch; skip those that fail.
-                valid_img_embs = []
-                valid_texts = []
+                # Encode images, skip failures
+                valid_pairs = []
                 for p, t in zip(img_paths, texts):
                     try:
                         emb_i = self.img_pipe.encode(p, use_cache=False).float()
+                        valid_pairs.append((emb_i, t))
                     except Exception as e:
                         print(f"[Fusion.train_projection] Warning: failed image encode {p}: {e}; skipping sample")
                         continue
-                    # record
-                    valid_img_embs.append(emb_i)
-                    valid_texts.append(t)
 
-                if len(valid_img_embs) == 0:
-                    print(f"[Fusion.train_projection] Warning: no valid images in batch #{batch_idx}; skipping")
+                if not valid_pairs:
+                    print(f"[Fusion.train_projection] Warning: no valid pairs in batch #{batch_idx}; skipping")
                     continue
 
-                # Encode texts in batch (try efficient batch encode, fallback to per-sample)
+                # Build tensors
+                img_embs = torch.stack([v[0] for v in valid_pairs]).to(self.device)
+                txts = [v[1] for v in valid_pairs]
+
+                # Encode texts (try batch encode, fallback per-sample)
                 try:
-                    # sentence-transformers provides batch encode
-                    text_embs = self.text_pipe.model.encode(list(valid_texts), convert_to_tensor=True)
-                    text_embs = text_embs.to(self.device).float()
+                    txt_embs = self.text_pipe.model.encode(txts, convert_to_tensor=True).to(self.device).float()
                 except Exception as e:
                     print(f"[Fusion.train_projection] Warning: batch text encode failed: {e}; trying per-sample")
                     tmp = []
-                    for tt in valid_texts:
+                    for tt in txts:
                         try:
                             tmp_emb = self.text_pipe.encode(tt, use_cache=False).float()
                             tmp.append(tmp_emb)
                         except Exception as e2:
-                            print(f"[Fusion.train_projection] Warning: failed single text encode for '{tt}': {e2}; skipping")
-                    if len(tmp) == 0:
+                            print(f"[Fusion.train_projection] Warning: single text encode failed for '{tt}': {e2}")
+                    if not tmp:
                         print("[Fusion.train_projection] Warning: no valid text embeddings for this batch; skipping")
                         continue
-                    text_embs = torch.stack(tmp).to(self.device).float()
+                    txt_embs = torch.stack(tmp).to(self.device).float()
 
-                # stack image emb list -> tensor
-                try:
-                    img_embs_tensor = torch.stack(valid_img_embs).to(self.device)
-                except Exception as e:
-                    print(f"[Fusion.train_projection] Warning: failed stacking image embeddings: {e}; skipping batch")
-                    continue
+                # Ensure same batch size
+                if img_embs.size(0) != txt_embs.size(0):
+                    m = min(img_embs.size(0), txt_embs.size(0))
+                    img_embs = img_embs[:m]
+                    txt_embs = txt_embs[:m]
 
-                # ensure same batch size for images & texts
-                if img_embs_tensor.size(0) != text_embs.size(0):
-                    min_b = min(img_embs_tensor.size(0), text_embs.size(0))
-                    img_embs_tensor = img_embs_tensor[:min_b]
-                    text_embs = text_embs[:min_b]
+                # Project
+                i_proj = self.img_proj(img_embs)
+                t_proj = self.text_proj(txt_embs)
 
-                # project
-                i_proj = self.img_proj(img_embs_tensor)
-                t_proj = self.text_proj(text_embs)
-
-                # normalize
+                # Normalize
                 i_norm = F.normalize(i_proj, dim=-1)
                 t_norm = F.normalize(t_proj, dim=-1)
 
-                # logits and contrastive loss (bidirectional)
                 logits = torch.matmul(t_norm, i_norm.t()) / temperature
                 labels = torch.arange(logits.size(0)).long().to(self.device)
-                loss_t2i = F.cross_entropy(logits, labels)
-                loss_i2t = F.cross_entropy(logits.t(), labels)
-                loss = 0.5 * (loss_t2i + loss_i2t)
 
-                optimizer.zero_grad()
+                loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
+
+                opt.zero_grad()
                 loss.backward()
-                optimizer.step()
+                opt.step()
 
                 total_loss += float(loss.item())
-                batches += 1
+                processed_batches += 1
 
-            avg_loss = (total_loss / batches) if batches > 0 else 0.0
-            print(f"[Fusion.train_projection] Epoch {epoch+1}/{epochs} avg_loss={avg_loss:.4f} (batches={batches})")
+            avg_loss = (total_loss / processed_batches) if processed_batches else 0.0
+            print(f"[Fusion.train_projection] Epoch {epoch+1}/{epochs} avg_loss={avg_loss:.4f} (processed_batches={processed_batches})")
+            total_processed_batches += processed_batches
 
-        # Save projection head weights
-        if save:
+        # Save only if some batches processed
+        if save and total_processed_batches > 0:
             try:
                 torch.save({
                     "text_proj": self.text_proj.state_dict(),
@@ -254,15 +286,12 @@ class FusionPipeline:
                 print(f"[Fusion.train_projection] Saved projection weights to {self._weights_file}")
             except Exception as e:
                 print(f"[Fusion.train_projection] Warning: failed to save weights: {e}")
+        else:
+            print("[Fusion.train_projection] No batches processed -> not saving projection weights.")
 
-        # switch to eval
-        self.text_proj.eval()
-        self.img_proj.eval()
+        self.text_proj.eval(); self.img_proj.eval()
 
     def load_projection(self, path: Optional[str] = None):
-        """
-        Load saved projection weights (if present).
-        """
         p = path or self._weights_file
         if os.path.exists(p):
             try:
@@ -273,4 +302,4 @@ class FusionPipeline:
             except Exception as e:
                 print(f"[FusionPipeline] Error loading projection weights from {p}: {e}")
         else:
-            print(f"[FusionPipeline] No projection weights found at {p}; continuing without loaded weights.")
+            print(f"[FusionPipeline] No projection weights found at {p}; continue without loading.")
