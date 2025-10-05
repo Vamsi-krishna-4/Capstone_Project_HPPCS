@@ -1,1 +1,1 @@
-python main.py
+python main.py --train True --cases 5
