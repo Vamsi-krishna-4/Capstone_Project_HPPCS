@@ -7,7 +7,7 @@ This script:
 - Optionally trains small projection heads (contrastive) in FusionPipeline
 - For each case produces: conversation_{i}.json with fields:
     case_id, image, clinical_note, similarity_score, explanation, diagnosis_tag, generated_at
-- Writes a concise, text-only Report to ../Report/Report.pdf (creates the directory)
+- Writes a concise, text-only Report to ../Report/Project_Report.pdf (creates the directory)
 - Uses two LLMs:
     - google/flan-t5-small (explanations)
     - sshleifer/distilbart-cnn-12-6 (diagnostic tag)
@@ -219,7 +219,7 @@ def build_report_text(outputs):
                   "and perform quantitative evaluation with clinician-labeled ground truth.\n")
     return header + abstract + methods + results + conclusion
 
-def write_report_pdf(report_text, filename="../Report/Report.pdf"):
+def write_report_pdf(report_text, filename="../Report/Project_Report.pdf"):
     """
     Attempt to write a PDF to filename using reportlab. If that fails, write a .txt fallback.
     Ensures the parent directory exists.
@@ -354,9 +354,9 @@ def main(args):
 
         outputs.append(result)
 
-    # 6) Build and write the report directly to ../Report/Report.pdf (or fallback ../Report/Report.txt)
+    # 6) Build and write the report directly to ../Report/Project_Report.pdf (or fallback ../Report/Report.txt)
     report_text = build_report_text(outputs)
-    report_path, is_pdf = write_report_pdf(report_text, filename="../Report/Report.pdf")
+    report_path, is_pdf = write_report_pdf(report_text, filename="../Report/Project_Report.pdf")
     if is_pdf:
         print(f"[main] Report PDF saved to {report_path} (move to submission zip as required).")
     else:

@@ -1,1 +1,54 @@
-python main.py --train True --cases 5
+# Execution Instructions for Capstone Project: Multimodal Medical Assistant (HPPCS[04])
+
+# 1. Environment Setup
+# ----------------------
+# This project is designed to run on Kaggle / Colab / local Python 3.10+ environments.
+# All required libraries are listed in requirements.txt.
+# Install them before running:
+!pip install -r requirements.txt
+
+# 2. Directory Structure
+# ----------------------
+# Ensure the following structure:
+# Capstone_Project_HPPCS/
+# ├── Codebase/
+# │   ├── main.py
+# │   ├── fusion_pipeline.py
+# │   ├── text_pipeline.py
+# │   ├── image_pipeline.py
+# │   ├── demo_data.py
+# │   ├── requirements.txt
+# │   └── execution.txt
+# └── Report/
+#     └── Report.pdf
+#     └── Project_Report.pdf
+#     
+
+# 3. Execution Command (Kaggle / Colab)
+# ----------------------
+# Move into the Codebase directory and run main.py as follows:
+!cd Capstone_Project_HPPCS/Codebase && python main.py --train True --cases 5
+
+# Optional Arguments:
+#   --train True/False   : Train or skip training for the fusion projection (default=True)
+#   --cases <int>        : Number of demo medical cases to generate (default=5)
+#   --device cuda/cpu    : Choose device for execution (auto-detects GPU if available)
+
+# Example (for CPU-only run):
+!cd Capstone_Project_HPPCS/Codebase && python main.py --train False --cases 5 --device cpu
+
+# 4. Output
+# ----------------------
+# After successful execution, the following files are generated inside Codebase/:
+#   - conversation_1.json ... conversation_5.json  → multimodal output per case
+#   - Project_Report.pdf                                   → concise auto-generated report
+#   - proj_weights.pt (optional, if training enabled)
+
+# 5. Notes
+# ----------------------
+# - GPU recommended for faster inference.
+# - If ReportLab is unavailable, fallback text report (Report.txt) is generated.
+# - Move Project_Report.pdf to the Report/ directory before final submission.
+# - Keep all files in the same folder (no subdirectories) for evaluation compatibility.
+
+# End of File
